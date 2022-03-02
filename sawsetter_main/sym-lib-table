@@ -1,0 +1,4 @@
+(sym_lib_table
+  (lib (name "esp32")(type "Legacy")(uri "C:/Users/Arlo/Desktop/sawsetter/library/kicad-libraries/libraries/ESP32-DEVKIT-V1.lib")(options "")(descr ""))
+  (lib (name "customparts")(type "KiCad")(uri "${KIPRJMOD}/customparts.kicad_sym")(options "")(descr ""))
+)
