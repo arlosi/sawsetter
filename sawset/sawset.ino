@@ -1,5 +1,6 @@
 // Libraries
 #include <LCD_I2C.h>
+#include <EEPROM.h>
 
 // PPI: counts teeth in an inch, including both ends
 // tooth_spacing = 2 / (ppi - 1)
@@ -7,12 +8,16 @@
 
 const float INCHES_TO_TICKS = 1 * 25.4 * 200 / 8;
 
+
+const int LIMIT = 13200;
+const int ZEROING_TARGET = -(LIMIT + 1000);
+
 // Pins
 const int PIN_LED = 14;
 
 const int PIN_DIR = 18;
 const int PIN_STEP = 19;
-const int PIN_NFAULT = 34;
+const int PIN_NFAULT = 34; // TODO.
 const int PIN_MOTOR_ON = 5;
 
 const int PIN_UP = 25;
@@ -35,14 +40,14 @@ const int LCD_HEIGHT = 4;
 // TIMING
 const int HOLD_THRESHOLD_MS = 500;
 const int MOTOR_TICK_PERIOD_US = 600;
+const int SLEEP_TIMER_MIN = 5;
 
 LCD_I2C lcd(LCD_ADDR, LCD_WIDTH, LCD_HEIGHT);
 
 enum lcd_opt {
-  LCD_JOG,
-  LCD_DIR,
   LCD_COUNT,
   LCD_TPI,
+  LCD_JOG,
   LCD_TEST,
   LCD_NUMENTRIES,
 };
@@ -62,10 +67,9 @@ enum Button {
 };
 
 const char* LCD_TITLES[] = {
-  "JOG: ",
-  "DIR: ",
   "COUNT: ",
   "PPI: ",
+  "JOG: ",
   "TEST: ",
   };
 
@@ -107,25 +111,25 @@ Button buttons() {
   }
   
   if ((last_button != BUTTON_NONE) && ((millis() - last_button_time) > HOLD_THRESHOLD_MS)) {
-    button = (Button)(button_read + 0); //TODO
+    button = (Button)(button_read + 0);
   }
 
   return button;
 }
 
-unsigned int cfg_tpi = 10;
-unsigned int cfg_count = 1;
 
 struct BufferedDisplay : public Print {
   char buffer[LCD_HEIGHT][LCD_WIDTH];
+  char buffer2[LCD_HEIGHT][LCD_WIDTH];
   int pos;
   int line;
 
   BufferedDisplay() {
-    reset();
+    flush();
   }
 
-  void reset() {
+  void flush() {
+    memcpy(buffer2, buffer, sizeof(buffer));
     memset(buffer, ' ', sizeof(buffer));
     pos = 0;
     line = 0;
@@ -149,8 +153,42 @@ struct BufferedDisplay : public Print {
   }
 };
 
+struct Cfg {
+  static portMUX_TYPE mux;
+  unsigned int tpi = 4;
+  unsigned int count = 1;
+  bool direction = false;
+
+  Cfg read() {
+    taskENTER_CRITICAL(&this->mux);
+    Cfg retval = *this;
+    taskEXIT_CRITICAL(&this->mux);
+    return retval;
+  }
+
+  void write(Cfg cfg) {
+    taskENTER_CRITICAL(&this->mux);
+    *this = cfg;
+    taskEXIT_CRITICAL(&this->mux);
+  }
+
+  void save(){
+    EEPROM.put(0, this->read());
+    EEPROM.commit();
+  }
+  
+  void restore() {
+    Cfg cfg;
+    EEPROM.get(0, cfg);
+    this->write(cfg);
+  }
+};
+portMUX_TYPE Cfg::mux = portMUX_INITIALIZER_UNLOCKED;
+
+Cfg _cfg{};
+
 volatile int _position = 0;
-volatile int _targetPosition = -12000;
+volatile int _targetPosition = ZEROING_TARGET;
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t _atPosition = xSemaphoreCreateBinary();
 
@@ -204,21 +242,15 @@ void IRAM_ATTR onTimerISR() {
   taskEXIT_CRITICAL_ISR(&mux);
   digitalWrite(PIN_STEP, step);
   digitalWrite(PIN_DIR, direction == 1);
-  digitalWrite(PIN_MOTOR_ON, 1);
 }
 
 
 BufferedDisplay buffer;
 
-void lcd_draw_running() {
-  buffer.reset();
-  buffer.println("RUNNING...");
-}
-
 void lcd_draw() {
-  buffer.reset();
   int position = get_position();
   int targetPosition = get_target_position();
+  Cfg cfg = _cfg.read();
   
   for (int line = 0; line < LCD_HEIGHT; line++){
     int option = line + lcd_offset;
@@ -227,7 +259,7 @@ void lcd_draw() {
     
     switch (option) {
       case LCD_TEST:
-        buffer.print("<HIT FNC>");
+        buffer.print("<STR FNC> ");
         buffer.print(digitalRead(PIN_LIMIT1));
         buffer.print(digitalRead(PIN_LIMIT2));
         break;
@@ -237,23 +269,25 @@ void lcd_draw() {
         buffer.print(targetPosition);
         break;
       case LCD_TPI:
-        buffer.print((float)cfg_tpi / 2);
+        buffer.print((float)cfg.tpi / 2);
         break;
       case LCD_COUNT:
-        buffer.print(cfg_count);
+        buffer.print(cfg.count);
         break;
     }
     buffer.println();
   }
+  buffer.flush();
 }
 
 enum MODE {
   MENU,
   RUNNING,
   ZEROING,
+  ERROR,
 };
 
-MODE mode = MENU;
+MODE mode = ZEROING;
 
 void move_blocking(int position) {
   // ensure semaphore is taken
@@ -280,15 +314,47 @@ int get_target_position() {
   return retval;
 }
 
+
+bool _cancel;
 void run_task(void*) {
-  float spacing = (2.0 / ((cfg_tpi / 2.0) - 1.0)) * INCHES_TO_TICKS;
-  int count = cfg_count;
+  _cancel = false;
+  _cfg.save();
+  Cfg cfg = _cfg.read();
+  float spacing = (2.0 / ((cfg.tpi / 2.0) - 1.0)) * INCHES_TO_TICKS;
+  int count = cfg.count;
+  
+  if (count * spacing > LIMIT) {
+    int max_count = LIMIT / spacing;
+    buffer.println("Saw does not fit.");
+    buffer.print("Max count is ");
+    buffer.print(max_count);
+    buffer.println(".");
+    buffer.println();
+    buffer.println("Press > to return");
+    buffer.flush();
+    while(!_cancel) {
+      vTaskDelay(100 / portTICK_RATE_MS);
+    }
+    mode = MENU;
+    vTaskDelete(NULL);
+    return;
+  }
 
   // Retract
-  digitalWrite(PIN_VALVE2, false);
+  digitalWrite(PIN_VALVE2, true);
   vTaskDelay(200 / portTICK_RATE_MS);
   
-  for (int i = 0; i < count; i++) {
+  for (int i = 0; i < count && !_cancel; i++) {
+    buffer.println("Setting...");
+    buffer.print(i + 1);
+    buffer.print(" / ");
+    buffer.print(count);
+    buffer.print(" (");
+    buffer.print((i + 1)*100 / count);
+    buffer.print("%)");
+    buffer.println();
+    buffer.flush();
+    
     move_blocking(i * spacing);
     
     // Fire
@@ -298,19 +364,63 @@ void run_task(void*) {
     vTaskDelay(50 / portTICK_RATE_MS);
   }
 
+  move_blocking(0);
+
   // Extend
-  digitalWrite(PIN_VALVE2, true);
+  digitalWrite(PIN_VALVE2, false);
+  mode = MENU;
+  vTaskDelete(NULL);
 }
 
 void ui_task(void*) {
   TickType_t pxPreviousWakeTime = xTaskGetTickCount();
+  TickType_t lastActivityTime = xTaskGetTickCount();
   while(true) {
     vTaskDelayUntil(&pxPreviousWakeTime, 50 / portTICK_RATE_MS);
     Button button = buttons();
     int position = get_position();
     int targetPosition = get_target_position();
+    Cfg cfg = _cfg.read();
+
+    if (button != BUTTON_NONE) {
+      lastActivityTime = xTaskGetTickCount();
+    }
+
+    if (xTaskGetTickCount() - lastActivityTime > (SLEEP_TIMER_MIN*60*1000 / portTICK_RATE_MS)) {
+      buffer.println("Machine sleeping.");
+      buffer.println("Turn off power or");
+      buffer.println("press > to restart");
+      buffer.println("and re-zero.");
+      buffer.flush();
+      digitalWrite(PIN_MOTOR_ON, 0);
+      mode = ERROR;
+    }
 
     switch (mode) {
+      case ERROR:
+        if (button == BUTTON_RIGHT) {
+          ESP.restart();
+        }
+        break;
+      
+      case ZEROING:
+        if (position == ZEROING_TARGET) {
+          mode = ERROR;
+          buffer.println("Zeroing failed.");
+          buffer.println("Check limit switch,");
+          buffer.println("then > to retry.");
+        } else {
+          buffer.println(" Bad Axe Tool Works");
+          buffer.println("Automatic Saw Setter");
+          buffer.println();
+          buffer.println("     zeroing...");
+        }
+
+        buffer.flush();
+        if (position == 0 && targetPosition == 0) {
+          mode = MENU;
+        }
+      break;
       case MENU:
         // Adjust selected menu option
         switch (button) {
@@ -337,9 +447,11 @@ void ui_task(void*) {
             switch (button){
               case BUTTON_LEFT:
                 digitalWrite(PIN_VALVE1, true);
+                vTaskDelay(100 / portTICK_RATE_MS);
                 break;
               case BUTTON_RIGHT:
-                digitalWrite(PIN_VALVE2, true);
+                digitalWrite(PIN_VALVE2, true);                
+                vTaskDelay(100 / portTICK_RATE_MS);
                 break;
               case BUTTON_NONE:
                 digitalWrite(PIN_VALVE1, false);
@@ -351,8 +463,8 @@ void ui_task(void*) {
             switch (button) {
               case BUTTON_RIGHT:
                 targetPosition+=100;
-                if (targetPosition > 10700) {
-                  targetPosition = 10700;
+                if (targetPosition > LIMIT) {
+                  targetPosition = LIMIT;
                 }
                 move_blocking(targetPosition);
               break;
@@ -368,20 +480,20 @@ void ui_task(void*) {
           case LCD_TPI:
             switch (button) {
               case BUTTON_RIGHT:
-                if (cfg_tpi < 64) cfg_tpi++;
+                if (cfg.tpi < 64) cfg.tpi++;
               break;
               case BUTTON_LEFT:
-                if (cfg_tpi > 8) cfg_tpi--;
+                if (cfg.tpi > 8) cfg.tpi--;
               break;
             }
           break;
           case LCD_COUNT:
             switch (button) {
               case BUTTON_RIGHT:
-                if (cfg_count < 640) cfg_count++;
+                if (cfg.count < 640) cfg.count++;
               break;
               case BUTTON_LEFT:
-                if (cfg_count > 1) cfg_count--;
+                if (cfg.count > 1) cfg.count--;
               break;
             }
           break;
@@ -389,75 +501,26 @@ void ui_task(void*) {
 
         if (button == BUTTON_STARTSTOP) {
           mode = RUNNING;
-          run_task(NULL);
+          xTaskCreate(run_task, "run_task", 8192, NULL, 2, NULL);
         }
-    
-        // Update the LCD buffer
         lcd_draw();
       break;
       case RUNNING:
-        if (button == BUTTON_STARTSTOP) {
-          mode = MENU;
+        if (button == BUTTON_STARTSTOP || button == BUTTON_RIGHT) {
+          _cancel = true;
         }
-        lcd_draw_running();
       break;
     }
+    _cfg.write(cfg);
   }
 }
-
-/*
-#include <WiFi.h>
-#include <ESPmDNS.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
-const char* ssid = "Home";
-const char* password = "domecile";
-void otaSetup() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    Serial.println("Connection Failed! Rebooting...");
-    delay(5000);
-    ESP.restart();
-  }
-  ArduinoOTA
-    .onStart([]() {
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH)
-        type = "sketch";
-      else // U_SPIFFS
-        type = "filesystem";
-
-      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-      Serial.println("Start updating " + type);
-    })
-    .onEnd([]() {
-      Serial.println("\nEnd");
-    })
-    .onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    })
-    .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
-
-  ArduinoOTA.begin();
-
-  Serial.println("Ready");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-*/
 
 void setup()
 {
   Serial.begin(115200);
-  //otaSetup();
+  Serial.println("Bad Axe Saw Setter");
+  
+  EEPROM.begin(sizeof(Cfg));
   
   pinMode(PIN_DIR, OUTPUT);
   pinMode(PIN_STEP, OUTPUT);
@@ -478,12 +541,17 @@ void setup()
   pinMode(PIN_GO, INPUT_PULLUP);
 
   digitalWrite(PIN_LED, true);
+  digitalWrite(PIN_MOTOR_ON, 1);
+
+  // Hold UP to skip reading config on boot.
+  if (digitalRead(PIN_UP)) {
+    _cfg.restore();
+  }
+  
   hw_timer_t* timer = timerBegin(0, 80, true); // 80MHz
   timerAttachInterrupt(timer, &onTimerISR, true);
   timerAlarmWrite(timer, MOTOR_TICK_PERIOD_US, true);
   timerAlarmEnable(timer);
-
-  digitalWrite(PIN_VALVE2, true);
 
   lcd.begin();
   lcd.backlight();
@@ -496,7 +564,7 @@ void lcd_xmit(){
   for (int line = 0; line < LCD_HEIGHT; line++) {
     lcd.setCursor(0, line);
     for (int c = 0; c < LCD_WIDTH; c++) {
-      lcd.write(buffer.buffer[line][c]);
+      lcd.write(buffer.buffer2[line][c]);
     }
   }
 }
@@ -504,5 +572,4 @@ void lcd_xmit(){
 void loop()
 {
   lcd_xmit();
-  //ArduinoOTA.handle();
 }
