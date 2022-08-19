@@ -8,7 +8,7 @@
 
 const float INCHES_TO_TICKS = 1 * 25.4 * 200 / 8;
 
-
+const int LIMIT_SWITCH_ZERO_OFFSET = 50;
 const int LIMIT = 13200;
 const int ZEROING_TARGET = -(LIMIT + 1000);
 
@@ -17,7 +17,7 @@ const int PIN_LED = 14;
 
 const int PIN_DIR = 18;
 const int PIN_STEP = 19;
-const int PIN_NFAULT = 34; // TODO.
+const int PIN_NFAULT = 34;
 const int PIN_MOTOR_ON = 5;
 
 const int PIN_UP = 25;
@@ -47,6 +47,7 @@ LCD_I2C lcd(LCD_ADDR, LCD_WIDTH, LCD_HEIGHT);
 enum lcd_opt {
   LCD_COUNT,
   LCD_TPI,
+  LCD_LENGTH,
   LCD_JOG,
   LCD_TEST,
   LCD_NUMENTRIES,
@@ -67,8 +68,9 @@ enum Button {
 };
 
 const char* LCD_TITLES[] = {
-  "COUNT: ",
+  "Strikes: ",
   "PPI: ",
+  "Length: ",
   "JOG: ",
   "TEST: ",
   };
@@ -155,8 +157,9 @@ struct BufferedDisplay : public Print {
 
 struct Cfg {
   static portMUX_TYPE mux;
-  unsigned int tpi = 4;
+  unsigned int tpi = 8;
   unsigned int count = 1;
+  unsigned int length = 12;
   bool direction = false;
 
   Cfg read() {
@@ -207,7 +210,7 @@ void IRAM_ATTR onTimerISR() {
   
   taskENTER_CRITICAL_ISR(&mux);
   if (limit_pressed && !zero_completed) {
-    _position = -50;
+    _position = -LIMIT_SWITCH_ZERO_OFFSET;
     _targetPosition = 0;
     zero_completed = true;
   }
@@ -274,6 +277,9 @@ void lcd_draw() {
       case LCD_COUNT:
         buffer.print(cfg.count);
         break;
+      case LCD_LENGTH:
+        buffer.print(cfg.length);
+        break;
     }
     buffer.println();
   }
@@ -289,14 +295,18 @@ enum MODE {
 
 MODE mode = ZEROING;
 
-void move_blocking(int position) {
+void move_nonblocking(int position) {
   // ensure semaphore is taken
   xSemaphoreTake(_atPosition, portMAX_DELAY);
 
   portENTER_CRITICAL(&mux);
+  xSemaphoreTake(_atPosition, 0);
   _targetPosition = position;
   portEXIT_CRITICAL(&mux);
-  
+}
+
+void move_blocking(int position) {
+  move_nonblocking(position);
   xSemaphoreTake(_atPosition, portMAX_DELAY);
 }
 
@@ -322,15 +332,17 @@ void run_task(void*) {
   Cfg cfg = _cfg.read();
   float spacing = (2.0 / ((cfg.tpi / 2.0) - 1.0)) * INCHES_TO_TICKS;
   int count = cfg.count;
-  
-  if (count * spacing > LIMIT) {
-    int max_count = LIMIT / spacing;
+
+  int starting_point = (LIMIT / 2) - (INCHES_TO_TICKS * cfg.length / 2);
+  int available_ticks = LIMIT - starting_point;
+  if (count * spacing > available_ticks) {
+    int max_count = available_ticks / spacing;
     buffer.println("Saw does not fit.");
     buffer.print("Max count is ");
     buffer.print(max_count);
     buffer.println(".");
     buffer.println();
-    buffer.println("Press > to return");
+    buffer.println("Press STOP to return");
     buffer.flush();
     while(!_cancel) {
       vTaskDelay(100 / portTICK_RATE_MS);
@@ -351,11 +363,10 @@ void run_task(void*) {
     buffer.print(count);
     buffer.print(" (");
     buffer.print((i + 1)*100 / count);
-    buffer.print("%)");
-    buffer.println();
+    buffer.println("%)");
     buffer.flush();
     
-    move_blocking(i * spacing);
+    move_blocking(starting_point + i * spacing);
     
     // Fire
     digitalWrite(PIN_VALVE1, true);
@@ -364,7 +375,7 @@ void run_task(void*) {
     vTaskDelay(50 / portTICK_RATE_MS);
   }
 
-  move_blocking(0);
+  move_blocking(starting_point);
 
   // Extend
   digitalWrite(PIN_VALVE2, false);
@@ -388,9 +399,8 @@ void ui_task(void*) {
 
     if (xTaskGetTickCount() - lastActivityTime > (SLEEP_TIMER_MIN*60*1000 / portTICK_RATE_MS)) {
       buffer.println("Machine sleeping.");
-      buffer.println("Turn off power or");
-      buffer.println("press > to restart");
-      buffer.println("and re-zero.");
+      buffer.println("Press UP to restart");
+      buffer.println("(machine will zero)");
       buffer.flush();
       digitalWrite(PIN_MOTOR_ON, 0);
       mode = ERROR;
@@ -398,7 +408,7 @@ void ui_task(void*) {
 
     switch (mode) {
       case ERROR:
-        if (button == BUTTON_RIGHT) {
+        if (button == BUTTON_UP) {
           ESP.restart();
         }
         break;
@@ -408,7 +418,7 @@ void ui_task(void*) {
           mode = ERROR;
           buffer.println("Zeroing failed.");
           buffer.println("Check limit switch,");
-          buffer.println("then > to retry.");
+          buffer.println("then UP to retry.");
         } else {
           buffer.println(" Bad Axe Tool Works");
           buffer.println("Automatic Saw Setter");
@@ -497,11 +507,21 @@ void ui_task(void*) {
               break;
             }
           break;
+          case LCD_LENGTH:
+            switch (button) {
+              case BUTTON_RIGHT:
+                if (cfg.length < 20) cfg.length += 2;
+              break;
+              case BUTTON_LEFT:
+                if (cfg.length > 10) cfg.length -= 2;
+              break;
+            }
+          break;
         }
 
         if (button == BUTTON_STARTSTOP) {
           mode = RUNNING;
-          xTaskCreate(run_task, "run_task", 8192, NULL, 2, NULL);
+          xTaskCreate(run_task, "run_task", 8192, NULL, 3, NULL);
         }
         lcd_draw();
       break;
