@@ -40,7 +40,7 @@ const int LCD_HEIGHT = 4;
 // TIMING
 const int HOLD_THRESHOLD_MS = 500;
 const int MOTOR_TICK_PERIOD_US = 600;
-const int SLEEP_TIMER_MIN = 5;
+const int SLEEP_TIMER_MIN = 10;
 
 LCD_I2C lcd(LCD_ADDR, LCD_WIDTH, LCD_HEIGHT);
 
@@ -355,7 +355,7 @@ void run_task(void*) {
   // Retract
   digitalWrite(PIN_VALVE2, true);
   vTaskDelay(200 / portTICK_RATE_MS);
-  
+
   for (int i = 0; i < count && !_cancel; i++) {
     buffer.println("Setting...");
     buffer.print(i + 1);
