@@ -386,12 +386,12 @@ void run_task(void*) {
 void ui_task(void*) {
   TickType_t pxPreviousWakeTime = xTaskGetTickCount();
   TickType_t lastActivityTime = xTaskGetTickCount();
+  Cfg cfg = _cfg.read();
   while(true) {
     vTaskDelayUntil(&pxPreviousWakeTime, 50 / portTICK_RATE_MS);
     Button button = buttons();
     int position = get_position();
     int targetPosition = get_target_position();
-    Cfg cfg = _cfg.read();
 
     if (button != BUTTON_NONE) {
       lastActivityTime = xTaskGetTickCount();
