@@ -49,9 +49,20 @@ enum lcd_opt {
   LCD_TPI,
   LCD_LENGTH,
   LCD_JOG,
+  LCD_LASER_OFFSET,
   LCD_TEST,
   LCD_NUMENTRIES,
 };
+
+const char* LCD_TITLES[] = {
+  "Strikes: ",
+  "PPI: ",
+  "Length: ",
+  "Jog: ",
+  "Laser:",
+  "Calib: ",
+};
+
 
 enum Button {
   BUTTON_NONE,
@@ -66,14 +77,6 @@ enum Button {
   BUTTON_STARTSTOP,
   BUTTON_STARTSTOP_HOLD,
 };
-
-const char* LCD_TITLES[] = {
-  "Strikes: ",
-  "PPI: ",
-  "Length: ",
-  "JOG: ",
-  "TEST: ",
-  };
 
 lcd_opt selected_option = LCD_COUNT;
 int lcd_offset = 0;
@@ -160,7 +163,7 @@ struct Cfg {
   unsigned int tpi = 8;
   unsigned int count = 1;
   unsigned int length = 12;
-  bool direction = false;
+  unsigned int laser_offset = 1850;
 
   Cfg read() {
     taskENTER_CRITICAL(&this->mux);
@@ -279,6 +282,11 @@ void lcd_draw() {
         break;
       case LCD_LENGTH:
         buffer.print(cfg.length);
+        buffer.print("\"");
+        break;
+      case LCD_LASER_OFFSET:
+        buffer.print(cfg.laser_offset / 1000.0, 3);
+        buffer.print("\"");
         break;
     }
     buffer.println();
@@ -297,7 +305,7 @@ MODE mode = ZEROING;
 
 void move_nonblocking(int position) {
   // ensure semaphore is taken
-  xSemaphoreTake(_atPosition, portMAX_DELAY);
+  xSemaphoreTake(_atPosition, 0);
 
   portENTER_CRITICAL(&mux);
   xSemaphoreTake(_atPosition, 0);
@@ -324,6 +332,13 @@ int get_target_position() {
   return retval;
 }
 
+int starting_point(const struct Cfg& cfg) {
+  return (LIMIT / 2) - (INCHES_TO_TICKS * cfg.length / 2);
+}
+
+int offset_starting_point(const struct Cfg& cfg) {
+  return starting_point(cfg) + cfg.laser_offset * INCHES_TO_TICKS / 1000.0;
+}
 
 bool _cancel;
 void run_task(void*) {
@@ -333,8 +348,8 @@ void run_task(void*) {
   float spacing = (2.0 / ((cfg.tpi / 2.0) - 1.0)) * INCHES_TO_TICKS;
   int count = cfg.count;
 
-  int starting_point = (LIMIT / 2) - (INCHES_TO_TICKS * cfg.length / 2);
-  int available_ticks = LIMIT - starting_point;
+  int start = starting_point(cfg);
+  int available_ticks = LIMIT - start;
   if (count * spacing > available_ticks) {
     int max_count = available_ticks / spacing;
     buffer.println("Saw does not fit.");
@@ -366,16 +381,16 @@ void run_task(void*) {
     buffer.println("%)");
     buffer.flush();
     
-    move_blocking(starting_point + i * spacing);
+    move_blocking(start + i * spacing);
     
     // Fire
     digitalWrite(PIN_VALVE1, true);
     vTaskDelay(100 / portTICK_RATE_MS);
     digitalWrite(PIN_VALVE1, false);
-    vTaskDelay(50 / portTICK_RATE_MS);
+    vTaskDelay(75 / portTICK_RATE_MS);
   }
 
-  move_blocking(starting_point);
+  move_blocking(offset_starting_point(cfg));
 
   // Extend
   digitalWrite(PIN_VALVE2, false);
@@ -430,6 +445,7 @@ void ui_task(void*) {
 
         buffer.flush();
         if (position == 0 && targetPosition == 0) {
+          move_nonblocking(offset_starting_point(cfg));
           mode = MENU;
         }
       break;
@@ -468,6 +484,7 @@ void ui_task(void*) {
               case BUTTON_NONE:
                 digitalWrite(PIN_VALVE1, false);
                 digitalWrite(PIN_VALVE2, false);
+                move_nonblocking(starting_point(cfg));
                 break;
             }
             break;
@@ -478,14 +495,14 @@ void ui_task(void*) {
                 if (jog_in > 20) {
                   jog_in = 20 ;
                 }
-                move_blocking(jog_in * INCHES_TO_TICKS);
+                move_nonblocking(jog_in * INCHES_TO_TICKS);
               break;
               case BUTTON_LEFT:
                 jog_in-=1;
                 if (jog_in < 0) {
                   jog_in = 0;
                 }
-                move_blocking(jog_in * INCHES_TO_TICKS);
+                move_nonblocking(jog_in * INCHES_TO_TICKS);
               break;
             }
             break;
@@ -513,11 +530,24 @@ void ui_task(void*) {
             switch (button) {
               case BUTTON_RIGHT:
                 if (cfg.length < 20) cfg.length += 2;
+                move_nonblocking(offset_starting_point(cfg));
               break;
               case BUTTON_LEFT:
                 if (cfg.length > 10) cfg.length -= 2;
+                move_nonblocking(offset_starting_point(cfg));
               break;
             }
+          break;
+          case LCD_LASER_OFFSET:
+            switch (button) {
+              case BUTTON_RIGHT:
+                if (cfg.laser_offset < 2250) cfg.laser_offset += 2;
+              break;
+              case BUTTON_LEFT:
+                if (cfg.laser_offset > 1500) cfg.laser_offset -= 2;
+              break;
+            }
+            move_nonblocking(offset_starting_point(cfg));
           break;
         }
 
