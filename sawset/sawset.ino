@@ -6,7 +6,7 @@
 // tooth_spacing = 2 / (ppi - 1)
 // 200 ticks = 8mm
 
-const float INCHES_TO_TICKS = 1 * 25.4 * 200 / 8;
+const float INCHES_TO_TICKS = 0.999136 * 25.4 * 200 / 8;
 
 const int LIMIT_SWITCH_ZERO_OFFSET = 50;
 const int LIMIT = 13200;
@@ -384,8 +384,10 @@ void run_task(void*) {
 }
 
 void ui_task(void*) {
+  int jog_in = 0;
   TickType_t pxPreviousWakeTime = xTaskGetTickCount();
   TickType_t lastActivityTime = xTaskGetTickCount();
+  
   Cfg cfg = _cfg.read();
   while(true) {
     vTaskDelayUntil(&pxPreviousWakeTime, 50 / portTICK_RATE_MS);
@@ -472,18 +474,18 @@ void ui_task(void*) {
           case LCD_JOG:
             switch (button) {
               case BUTTON_RIGHT:
-                targetPosition+=100;
-                if (targetPosition > LIMIT) {
-                  targetPosition = LIMIT;
+                jog_in+=1;
+                if (jog_in > 20) {
+                  jog_in = 20 ;
                 }
-                move_blocking(targetPosition);
+                move_blocking(jog_in * INCHES_TO_TICKS);
               break;
               case BUTTON_LEFT:
-                targetPosition-=100;
-                if (targetPosition < 0) {
-                  targetPosition = 0;
+                jog_in-=1;
+                if (jog_in < 0) {
+                  jog_in = 0;
                 }
-                move_blocking(targetPosition);
+                move_blocking(jog_in * INCHES_TO_TICKS);
               break;
             }
             break;
