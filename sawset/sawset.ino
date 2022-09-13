@@ -6,7 +6,7 @@
 // tooth_spacing = 2 / (ppi - 1)
 // 200 ticks = 8mm
 
-const float INCHES_TO_TICKS = 0.999136 * 25.4 * 200 / 8;
+const float INCHES_TO_TICKS_UNCAL = 25.4 * 200 / 8;
 
 const int LIMIT_SWITCH_ZERO_OFFSET = 50;
 const int LIMIT = 13200;
@@ -49,6 +49,8 @@ enum lcd_opt {
   LCD_TPI,
   LCD_LENGTH,
   LCD_JOG,
+  LCD_ADVANCED,
+  LCD_TICK_CALIB,
   LCD_LASER_OFFSET,
   LCD_TEST,
   LCD_NUMENTRIES,
@@ -59,8 +61,10 @@ const char* LCD_TITLES[] = {
   "PPI: ",
   "Length: ",
   "Jog: ",
-  "Laser:",
-  "Calib: ",
+  "-ADVANCED-",
+  "Tick Calib: ",
+  "Cam Offset:",
+  "Test: ",
 };
 
 
@@ -164,6 +168,12 @@ struct Cfg {
   unsigned int count = 1;
   unsigned int length = 12;
   unsigned int laser_offset = 1850;
+  int tick_calib = 0;
+
+  float inches_to_ticks() const {
+    float cal = (float)this->tick_calib;
+    return (1.0 + cal / 100000.0) * INCHES_TO_TICKS_UNCAL;
+  }
 
   Cfg read() {
     taskENTER_CRITICAL(&this->mux);
@@ -288,6 +298,10 @@ void lcd_draw() {
         buffer.print(cfg.laser_offset / 1000.0, 3);
         buffer.print("\"");
         break;
+      case LCD_TICK_CALIB:
+        buffer.print(cfg.tick_calib / 1000.0, 3);
+        buffer.print("%");
+        break;
     }
     buffer.println();
   }
@@ -333,11 +347,11 @@ int get_target_position() {
 }
 
 int starting_point(const struct Cfg& cfg) {
-  return (LIMIT / 2) - (INCHES_TO_TICKS * cfg.length / 2);
+  return (LIMIT / 2) - (cfg.inches_to_ticks() * cfg.length / 2);
 }
 
 int offset_starting_point(const struct Cfg& cfg) {
-  return starting_point(cfg) + cfg.laser_offset * INCHES_TO_TICKS / 1000.0;
+  return starting_point(cfg) + cfg.laser_offset * cfg.inches_to_ticks() / 1000.0;
 }
 
 bool _cancel;
@@ -345,7 +359,7 @@ void run_task(void*) {
   _cancel = false;
   _cfg.save();
   Cfg cfg = _cfg.read();
-  float spacing = (2.0 / ((cfg.tpi / 2.0) - 1.0)) * INCHES_TO_TICKS;
+  float spacing = (2.0 / ((cfg.tpi / 2.0) - 1.0)) * cfg.inches_to_ticks();
   int count = cfg.count;
 
   int start = starting_point(cfg);
@@ -495,14 +509,14 @@ void ui_task(void*) {
                 if (jog_in > 20) {
                   jog_in = 20 ;
                 }
-                move_nonblocking(jog_in * INCHES_TO_TICKS);
+                move_nonblocking(jog_in * cfg.inches_to_ticks());
               break;
               case BUTTON_LEFT:
                 jog_in-=1;
                 if (jog_in < 0) {
                   jog_in = 0;
                 }
-                move_nonblocking(jog_in * INCHES_TO_TICKS);
+                move_nonblocking(jog_in * cfg.inches_to_ticks());
               break;
             }
             break;
@@ -548,6 +562,18 @@ void ui_task(void*) {
               break;
             }
             move_nonblocking(offset_starting_point(cfg));
+          break;
+          case LCD_TICK_CALIB:
+            switch (button) {
+              case BUTTON_RIGHT:
+                if (cfg.tick_calib < 1000) cfg.tick_calib += 1;
+                move_nonblocking(jog_in * cfg.inches_to_ticks());
+              break;
+              case BUTTON_LEFT:
+                if (cfg.tick_calib > -1000) cfg.tick_calib -= 1;
+                move_nonblocking(jog_in * cfg.inches_to_ticks());
+              break;
+            }
           break;
         }
 
