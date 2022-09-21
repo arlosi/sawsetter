@@ -12,6 +12,9 @@ const int LIMIT_SWITCH_ZERO_OFFSET = 50;
 const int LIMIT = 13200;
 const int ZEROING_TARGET = -(LIMIT + 1000);
 
+const float GRIND_START_IN = 7;
+const float GRIND_LENGTH_IN = 5.5;
+
 // Pins
 const int PIN_LED = 14;
 
@@ -48,11 +51,12 @@ enum lcd_opt {
   LCD_COUNT,
   LCD_TPI,
   LCD_LENGTH,
-  LCD_JOG,
   LCD_ADVANCED,
+  LCD_JOG,
   LCD_TICK_CALIB,
   LCD_LASER_OFFSET,
   LCD_TEST,
+  LCD_GRIND,
   LCD_NUMENTRIES,
 };
 
@@ -60,11 +64,12 @@ const char* LCD_TITLES[] = {
   "Strikes: ",
   "PPI: ",
   "Length: ",
-  "Jog: ",
   "-ADVANCED-",
+  "Jog: ",
   "Tick Calib: ",
   "Cam Offset:",
   "Test: ",
+  "Grind: Press >",
 };
 
 
@@ -172,7 +177,7 @@ struct Cfg {
 
   float inches_to_ticks() const {
     float cal = (float)this->tick_calib;
-    return (1.0 + cal / 100000.0) * INCHES_TO_TICKS_UNCAL;
+    return (1.0 + cal / 10000.0) * INCHES_TO_TICKS_UNCAL;
   }
 
   Cfg read() {
@@ -299,7 +304,7 @@ void lcd_draw() {
         buffer.print("\"");
         break;
       case LCD_TICK_CALIB:
-        buffer.print(cfg.tick_calib / 1000.0, 3);
+        buffer.print(cfg.tick_calib / 100.0, 2);
         buffer.print("%");
         break;
     }
@@ -312,6 +317,7 @@ enum MODE {
   MENU,
   RUNNING,
   ZEROING,
+  GRINDING,
   ERROR,
 };
 
@@ -357,7 +363,6 @@ int offset_starting_point(const struct Cfg& cfg) {
 bool _cancel;
 void run_task(void*) {
   _cancel = false;
-  _cfg.save();
   Cfg cfg = _cfg.read();
   float spacing = (2.0 / ((cfg.tpi / 2.0) - 1.0)) * cfg.inches_to_ticks();
   int count = cfg.count;
@@ -411,6 +416,41 @@ void run_task(void*) {
   mode = MENU;
   vTaskDelete(NULL);
 }
+
+void grind_task(void*) {
+  _cancel = false;
+  Cfg cfg = _cfg.read();
+
+  // Retract
+  digitalWrite(PIN_VALVE2, true);
+  vTaskDelay(200 / portTICK_RATE_MS);
+  int pos1 = cfg.inches_to_ticks() * GRIND_START_IN;
+  int pos2 = cfg.inches_to_ticks() * GRIND_LENGTH_IN;
+
+  move_blocking(pos1);
+  
+  buffer.println("Press > to start");
+  buffer.flush();
+  while(digitalRead(PIN_RIGHT)) {
+    vTaskDelay(100 / portTICK_RATE_MS);  
+  }
+
+  // Fire
+  digitalWrite(PIN_VALVE1, true);
+  vTaskDelay(100 / portTICK_RATE_MS);
+  buffer.println("Press GO to stop");
+  buffer.flush();
+      
+  while (!_cancel) {
+    move_blocking(pos2);
+    move_blocking(pos1);
+  }
+  // Unfire
+  digitalWrite(PIN_VALVE1, false);
+  mode = MENU;
+  vTaskDelete(NULL);
+}
+
 
 void ui_task(void*) {
   int jog_in = 0;
@@ -504,14 +544,14 @@ void ui_task(void*) {
             break;
           case LCD_JOG:
             switch (button) {
-              case BUTTON_RIGHT:
+              case BUTTON_LEFT:
                 jog_in+=1;
                 if (jog_in > 20) {
                   jog_in = 20 ;
                 }
                 move_nonblocking(jog_in * cfg.inches_to_ticks());
               break;
-              case BUTTON_LEFT:
+              case BUTTON_RIGHT:
                 jog_in-=1;
                 if (jog_in < 0) {
                   jog_in = 0;
@@ -566,25 +606,36 @@ void ui_task(void*) {
           case LCD_TICK_CALIB:
             switch (button) {
               case BUTTON_RIGHT:
-                if (cfg.tick_calib < 1000) cfg.tick_calib += 1;
+                if (cfg.tick_calib < 100) cfg.tick_calib += 1;
                 move_nonblocking(jog_in * cfg.inches_to_ticks());
               break;
               case BUTTON_LEFT:
-                if (cfg.tick_calib > -1000) cfg.tick_calib -= 1;
+                if (cfg.tick_calib > -100) cfg.tick_calib -= 1;
                 move_nonblocking(jog_in * cfg.inches_to_ticks());
+              break;
+            }
+          case LCD_GRIND:
+            switch (button) {
+              case BUTTON_RIGHT:
+              mode = GRINDING;
+              xTaskCreate(grind_task, "grind_task", 8192, NULL, 3, NULL);
               break;
             }
           break;
         }
 
         if (button == BUTTON_STARTSTOP) {
-          mode = RUNNING;
-          xTaskCreate(run_task, "run_task", 8192, NULL, 3, NULL);
+          _cfg.save();
+          if (selected_option < LCD_ADVANCED) {
+            mode = RUNNING;
+            xTaskCreate(run_task, "run_task", 8192, NULL, 3, NULL);
+          }
         }
         lcd_draw();
       break;
       case RUNNING:
-        if (button == BUTTON_STARTSTOP || button == BUTTON_RIGHT) {
+      case GRINDING:
+        if (button == BUTTON_STARTSTOP) {
           _cancel = true;
         }
       break;
