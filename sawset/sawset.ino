@@ -425,7 +425,7 @@ void grind_task(void*) {
   digitalWrite(PIN_VALVE2, true);
   vTaskDelay(200 / portTICK_RATE_MS);
   int pos1 = cfg.inches_to_ticks() * GRIND_START_IN;
-  int pos2 = cfg.inches_to_ticks() * GRIND_LENGTH_IN;
+  int pos2 = cfg.inches_to_ticks() * (GRIND_START_IN + GRIND_LENGTH_IN);
 
   move_blocking(pos1);
   
